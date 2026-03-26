@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spherical World First-Person</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+        
+        #crosshair {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 20px;
+            height: 20px;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            display: none;
+        }
+        #crosshair::before, #crosshair::after {
+            content: '';
+            position: absolute;
+            background: white;
+            box-shadow: 0 0 2px rgba(0,0,0,0.5);
+        }
+        #crosshair::before { top: 9px; left: 0; width: 20px; height: 2px; }
+        #crosshair::after { top: 0; left: 9px; width: 2px; height: 20px; }
+
+        #blocker {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background-color: rgba(15, 23, 42, 0.8);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- UI Overlay -->
+    <div id="blocker" class="backdrop-blur-sm transition-opacity duration-300">
+        <h1 class="text-5xl font-bold mb-4 text-emerald-400 drop-shadow-md">Pocket Planet</h1>
+        <p class="text-xl mb-8 text-slate-200">A spherical 3D world</p>
+        
+        <div class="bg-slate-800/80 p-6 rounded-xl border border-slate-600 mb-8 max-w-md text-center">
+            <h2 class="text-2xl font-semibold mb-4 text-emerald-300">Controls</h2>
+            <div class="grid grid-cols-2 gap-4 text-left text-slate-300">
+                <div class="flex items-center gap-2"><span class="bg-slate-700 px-2 py-1 rounded border border-slate-500 font-mono">W A S D</span> Move</div>
+                <div class="flex items-center gap-2"><span class="bg-slate-700 px-2 py-1 rounded border border-slate-500 font-mono">Mouse</span> Look Around</div>
+                <div class="col-span-2 text-sm text-slate-400 mt-2">* Notice how gravity dynamically adjusts to the center of the planet.</div>
+            </div>
+        </div>
+
+        <button id="startButton" class="px-8 py-4 bg-emerald-500 hover:bg-emerald-400 text-slate-900 font-bold rounded-full text-xl transition-all hover:scale-105 hover:shadow-[0_0_20px_rgba(16,185,129,0.5)]">
+            Click to Explore
+        </button>
+    </div>
+
+    <div id="crosshair"></div>
+
+    <script>
+        // --- 1. GAME SETTINGS & DATA-DRIVEN GENERATION ---
+        
+        // Simulating the data extracted from your Lighthouse JSON file
+        const parsedWebsiteData = {
+            performanceScore: 85,  // Determines planet size
+            accessibilityScore: 90, // Determines friendly animal count
+            seoScore: 100,         // Determines tree count
+            warningsAndErrors: 12  // Determines ENEMY count!
+        };
+
+        // Scale world based on JSON data
+        const PLANET_RADIUS = 50 + (parsedWebsiteData.performanceScore); // 135
+        const TREE_COUNT = parsedWebsiteData.seoScore * 8;               // 800
+        const ROCK_COUNT = Math.floor(TREE_COUNT * 0.6);                 // 480
+        const ANIMAL_COUNT = Math.floor(parsedWebsiteData.accessibilityScore / 2); // 45
+        const ENEMY_COUNT = parsedWebsiteData.warningsAndErrors;         // 12
+        
+        const PLAYER_SPEED = 24;
+        const PLAYER_HEIGHT = 2.0;
+        
+        let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false;
+        let isLocked = false;
+        let prevTime = performance.now();
+        let pitch = 0; // vertical camera rotation
+        const pitchLimit = Math.PI / 2 - 0.1;
+
+        // --- 2. THREE.JS INITIALIZATION ---
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x0f172a, 0.003);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2000);
+        
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        renderer.outputEncoding = THREE.sRGBEncoding;
+        document.body.appendChild(renderer.domElement);
+
+        // --- 3. LIGHTING ---
+        const ambientLight = new THREE.HemisphereLight(0xffffff, 0x444466, 0.5);
+        scene.add(ambientLight);
+
+        const sunLight = new THREE.DirectionalLight(0xffffee, 1.2);
+        sunLight.position.set(100, 150, 50);
+        sunLight.castShadow = true;
+        // Adjust shadow map for the large planet
+        const d = 180;
+        sunLight.shadow.camera.left = -d;
+        sunLight.shadow.camera.right = d;
+        sunLight.shadow.camera.top = d;
+        sunLight.shadow.camera.bottom = -d;
+        sunLight.shadow.camera.near = 0.1;
+        sunLight.shadow.camera.far = 400;
+        sunLight.shadow.mapSize.width = 2048;
+        sunLight.shadow.mapSize.height = 2048;
+        scene.add(sunLight);
+
+        // --- 4. WORLD GENERATION MATH ---
+        function getSurfaceData(normalizedPos) {
+            let nx = normalizedPos.x * PLANET_RADIUS;
+            let ny = normalizedPos.y * PLANET_RADIUS;
+            let nz = normalizedPos.z * PLANET_RADIUS;
+
+            // Base hills using layered sine waves
+            let noise = Math.sin(nx * 0.08) * Math.cos(ny * 0.08) * Math.sin(nz * 0.08) * 8.0;
+            noise += Math.sin(nx * 0.15) * Math.cos(nz * 0.15) * 3.0;
+
+            // Create a specific "pond" area
+            let lakeCenter = new THREE.Vector3(1, 0.5, 0).normalize();
+            let distToLake = normalizedPos.distanceTo(lakeCenter);
+            if (distToLake < 0.25) {
+                // Dig out a bowl shape for the pond
+                let depth = Math.pow((0.25 - distToLake) * 6.0, 2);
+                noise -= depth * 5;
+            }
+
+            // Create a flat area for the house
+            let houseCenter = new THREE.Vector3(-0.5, 0.8, -0.5).normalize();
+            let distToHouse = normalizedPos.distanceTo(houseCenter);
+            if (distToHouse < 0.15) {
+                // Flatten the terrain towards 0.5 noise
+                noise = THREE.MathUtils.lerp(noise, 0.5, 1.0 - (distToHouse / 0.15));
+            }
+
+            let height = PLANET_RADIUS + noise;
+            let isWater = false;
+            let waterLevel = PLANET_RADIUS - 0.5;
+
+            if (height < waterLevel) {
+                height = waterLevel; // Flatten out at water bottom for logic
+                isWater = true;
+            }
+
+            return {
+                position: normalizedPos.clone().multiplyScalar(height),
+                normal: normalizedPos.clone(),
+                isWater: isWater,
+                waterLevel: normalizedPos.clone().multiplyScalar(waterLevel)
+            };
+        }
+
+        // --- 5. ENVIRONMENT MESHES ---
+        
+        // A. Space Background (Stars)
+        const starsGeo = new THREE.BufferGeometry();
+        const starsArr = [];
+        const starPhases = [];
+        for(let i=0; i<1500; i++) {
+            const v = new THREE.Vector3(
+                Math.random() - 0.5,
+                Math.random() - 0.5,
+                Math.random() - 0.5
+            ).normalize().multiplyScalar(600 + Math.random() * 300);
+            starsArr.push(v.x, v.y, v.z);
+            starPhases.push(Math.random() * Math.PI * 2);
+        }
+        starsGeo.setAttribute('position', new THREE.Float32BufferAttribute(starsArr, 3));
+        starsGeo.setAttribute('phase', new THREE.Float32BufferAttribute(starPhases, 1));
+        const starsMat = new THREE.PointsMaterial({ color: 0xffffff, size: 2.0, sizeAttenuation: true, transparent: true, opacity: 1 });
+        const starField = new THREE.Points(starsGeo, starsMat);
+        scene.add(starField);
+
+        const spaceGeo = new THREE.SphereGeometry(800, 32, 32);
+        const spaceMat = new THREE.MeshBasicMaterial({ color: 0x0f172a, side: THREE.BackSide, transparent: true });
+        scene.add(new THREE.Mesh(spaceGeo, spaceMat));
+
+        // B. Planet Core / Land
+        const landGeo = new THREE.BoxGeometry(1, 1, 1, 64, 64, 64);
+        const posAttr = landGeo.attributes.position;
+        const tempVec = new THREE.Vector3();
+        for (let i = 0; i < posAttr.count; i++) {
+            tempVec.fromBufferAttribute(posAttr, i).normalize();
+            let surface = getSurfaceData(tempVec);
+            posAttr.setXYZ(i, surface.position.x, surface.position.y, surface.position.z);
+        }
+        landGeo.computeVertexNormals();
+
+        const landMat = new THREE.MeshStandardMaterial({ 
+            color: 0x5cb85c, 
+            roughness: 0.8,
+            flatShading: true 
+        });
+        const landMesh = new THREE.Mesh(landGeo, landMat);
+        landMesh.receiveShadow = true;
+        landMesh.castShadow = true;
+        scene.add(landMesh);
+
+        // C. Water
+        const waterGeo = new THREE.IcosahedronGeometry(PLANET_RADIUS - 0.5, 4);
+        const waterMat = new THREE.MeshStandardMaterial({ 
+            color: 0x1da2d8, 
+            transparent: true, 
+            opacity: 0.85,
+            roughness: 0.1,
+            metalness: 0.1,
+            flatShading: true
+        });
+        const waterMesh = new THREE.Mesh(waterGeo, waterMat);
+        waterMesh.receiveShadow = true;
+        scene.add(waterMesh);
+
+        // D. Clouds
+        const cloudsRig = new THREE.Group();
+        const cloudGeo = new THREE.DodecahedronGeometry(3, 1);
+        const cloudMat = new THREE.MeshStandardMaterial({ color: 0xffffff, flatShading: true, transparent: true, opacity: 0.9 });
+        for(let i=0; i<12; i++) {
+            const cloud = new THREE.Mesh(cloudGeo, cloudMat);
+            cloud.position.copy(new THREE.Vector3(
+                Math.random()-0.5, Math.random()-0.5, Math.random()-0.5
+            ).normalize().multiplyScalar(PLANET_RADIUS + 15 + Math.random() * 10));
+            cloud.scale.set(1 + Math.random()*2, 0.5, 1 + Math.random()*2);
+            cloud.lookAt(0,0,0);
+            cloud.castShadow = true;
+            cloudsRig.add(cloud);
+        }
+        scene.add(cloudsRig);
+
+        // E. Props (Trees and Rocks) - IMPROVED SHAPES
+        
+        // --- Layered Pine Trees ---
+        const trunkGeo = new THREE.CylinderGeometry(0.4, 0.7, 3.0, 6);
+        trunkGeo.translate(0, 1.5, 0);
+        const trunkMat = new THREE.MeshStandardMaterial({ color: 0x6e4a36, flatShading: true });
+        const treeTrunks = new THREE.InstancedMesh(trunkGeo, trunkMat, TREE_COUNT);
+        treeTrunks.castShadow = true; treeTrunks.receiveShadow = true;
+
+        const leafMat = new THREE.MeshStandardMaterial({ color: 0x2e8f42, flatShading: true });
+        
+        // Tier 1 (Bottom)
+        const leaf1Geo = new THREE.ConeGeometry(2.5, 3.5, 7);
+        leaf1Geo.translate(0, 3.5, 0);
+        const treeLeaves1 = new THREE.InstancedMesh(leaf1Geo, leafMat, TREE_COUNT);
+        treeLeaves1.castShadow = true; treeLeaves1.receiveShadow = true;
+
+        // Tier 2 (Middle)
+        const leaf2Geo = new THREE.ConeGeometry(2.0, 3.0, 7);
+        leaf2Geo.translate(0, 5.5, 0);
+        const treeLeaves2 = new THREE.InstancedMesh(leaf2Geo, leafMat, TREE_COUNT);
+        treeLeaves2.castShadow = true; treeLeaves2.receiveShadow = true;
+
+        // Tier 3 (Top)
+        const leaf3Geo = new THREE.ConeGeometry(1.4, 2.5, 7);
+        leaf3Geo.translate(0, 7.5, 0);
+        const treeLeaves3 = new THREE.InstancedMesh(leaf3Geo, leafMat, TREE_COUNT);
+        treeLeaves3.castShadow = true; treeLeaves3.receiveShadow = true;
+
+        // --- Jagged Rocks ---
+        const rockGeo = new THREE.IcosahedronGeometry(1.5, 0); // Icosahedron makes better jagged rocks
+        rockGeo.translate(0, 0.5, 0);
+        const rockMat = new THREE.MeshStandardMaterial({ color: 0x8a959e, flatShading: true, roughness: 0.9 });
+        const rocks = new THREE.InstancedMesh(rockGeo, rockMat, ROCK_COUNT);
+        rocks.castShadow = true; rocks.receiveShadow = true;
+
+        const dummy = new THREE.Object3D();
+        const upVec = new THREE.Vector3(0,1,0);
+
+        // Scatter Trees
+        let placedTrees = 0;
+        while(placedTrees < TREE_COUNT) {
+            let dir = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize();
+            let surf = getSurfaceData(dir);
+            if(!surf.isWater && surf.position.length() > PLANET_RADIUS + 0.2) {
+                dummy.position.copy(surf.position);
+                dummy.quaternion.setFromUnitVectors(upVec, dir);
+                dummy.rotateY(Math.random() * Math.PI * 2);
+                // Slight random tilt
+                dummy.rotateX((Math.random() - 0.5) * 0.2); 
+                dummy.rotateZ((Math.random() - 0.5) * 0.2);
+                
+                let scale = 0.5 + Math.random() * 0.6;
+                dummy.scale.set(scale, scale * (0.8 + Math.random()*0.4), scale);
+                dummy.updateMatrix();
+                
+                treeTrunks.setMatrixAt(placedTrees, dummy.matrix);
+                treeLeaves1.setMatrixAt(placedTrees, dummy.matrix);
+                treeLeaves2.setMatrixAt(placedTrees, dummy.matrix);
+                treeLeaves3.setMatrixAt(placedTrees, dummy.matrix);
+                placedTrees++;
+            }
+        }
+        scene.add(treeTrunks);
+        scene.add(treeLeaves1);
+        scene.add(treeLeaves2);
+        scene.add(treeLeaves3);
+
+        // Scatter Rocks
+        let placedRocks = 0;
+        while(placedRocks < ROCK_COUNT) {
+            let dir = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize();
+            let surf = getSurfaceData(dir);
+            dummy.position.copy(surf.position);
+            // Sink rocks into ground
+            dummy.position.add(dir.clone().multiplyScalar(-0.6)); 
+            dummy.quaternion.setFromUnitVectors(upVec, dir);
+            dummy.rotateY(Math.random() * Math.PI * 2);
+            dummy.rotateX(Math.random() * Math.PI); // Randomize orientation completely
+            
+            // Randomly stretch axes to make jagged sharp formations
+            let sX = 0.5 + Math.random() * 1.5;
+            let sY = 0.5 + Math.random() * 2.0;
+            let sZ = 0.5 + Math.random() * 1.5;
+            dummy.scale.set(sX, sY, sZ);
+            dummy.updateMatrix();
+            rocks.setMatrixAt(placedRocks, dummy.matrix);
+            placedRocks++;
+        }
+        scene.add(rocks);
+
+        // F. Cozy Cottage (IMPROVED HOUSE)
+        const houseGroup = new THREE.Group();
+        
+        // Base structure
+        const houseBaseGeo = new THREE.BoxGeometry(7, 4.5, 6);
+        houseBaseGeo.translate(0, 2.25, 0);
+        const houseBaseMat = new THREE.MeshStandardMaterial({ color: 0xf4f1e1, roughness: 1.0 });
+        const houseBase = new THREE.Mesh(houseBaseGeo, houseBaseMat);
+        houseBase.castShadow = true; houseBase.receiveShadow = true;
+        
+        // Wooden Trim / Frame
+        const trimMat = new THREE.MeshStandardMaterial({ color: 0x4a3219, roughness: 0.9 });
+        const trim1 = new THREE.Mesh(new THREE.BoxGeometry(7.2, 0.4, 6.2), trimMat);
+        trim1.position.y = 0.2;
+        const trim2 = new THREE.Mesh(new THREE.BoxGeometry(7.2, 0.4, 6.2), trimMat);
+        trim2.position.y = 4.3;
+        const pillarGeo = new THREE.BoxGeometry(0.4, 4.5, 0.4);
+        const p1 = new THREE.Mesh(pillarGeo, trimMat); p1.position.set(3.5, 2.25, 3);
+        const p2 = new THREE.Mesh(pillarGeo, trimMat); p2.position.set(-3.5, 2.25, 3);
+        const p3 = new THREE.Mesh(pillarGeo, trimMat); p3.position.set(3.5, 2.25, -3);
+        const p4 = new THREE.Mesh(pillarGeo, trimMat); p4.position.set(-3.5, 2.25, -3);
+
+        // Pitched Roof (Rotated cylinder to make a pyramid/prism shape)
+        const roofGeo = new THREE.CylinderGeometry(0.1, 5.5, 7.5, 4);
+        // Rotate to fit the rectangular base properly
+        roofGeo.rotateY(Math.PI / 4);
+        roofGeo.rotateX(Math.PI / 2);
+        roofGeo.translate(0, 6.0, 0);
+        const roofMat = new THREE.MeshStandardMaterial({ color: 0x9b3b3b, roughness: 0.8, flatShading: true });
+        const roof = new THREE.Mesh(roofGeo, roofMat);
+        roof.castShadow = true; roof.receiveShadow = true;
+        
+        // Chimney
+        const chimneyGeo = new THREE.BoxGeometry(1.2, 3.5, 1.2);
+        chimneyGeo.translate(2.0, 6.5, -1.5);
+        const chimneyMat = new THREE.MeshStandardMaterial({ color: 0x7a8288, roughness: 0.9 });
+        const chimney = new THREE.Mesh(chimneyGeo, chimneyMat);
+        chimney.castShadow = true;
+
+        // Door
+        const doorGeo = new THREE.BoxGeometry(1.6, 2.8, 0.2);
+        doorGeo.translate(1.0, 1.4, 3.0);
+        const doorMat = new THREE.MeshStandardMaterial({ color: 0x3d2514 });
+        const door = new THREE.Mesh(doorGeo, doorMat);
+        
+        // Glowing Window
+        const winGeo = new THREE.CylinderGeometry(0.7, 0.7, 0.3, 16);
+        winGeo.rotateX(Math.PI / 2);
+        winGeo.translate(-1.5, 2.5, 3.0);
+        const winMat = new THREE.MeshStandardMaterial({ color: 0xe6d573, emissive: 0xc4b245, emissiveIntensity: 0.6 });
+        const windowMesh = new THREE.Mesh(winGeo, winMat);
+
+        houseGroup.add(houseBase, trim1, trim2, p1, p2, p3, p4, roof, chimney, door, windowMesh);
+        
+        // Place house
+        let houseSpotDir = new THREE.Vector3(-0.5, 0.8, -0.5).normalize();
+        let houseSurf = getSurfaceData(houseSpotDir);
+        houseGroup.position.copy(houseSurf.position);
+        houseGroup.quaternion.setFromUnitVectors(upVec, houseSpotDir);
+        houseGroup.rotateY(Math.PI * 0.8);
+        scene.add(houseGroup);
+
+        // G. Fluffy Sheep (IMPROVED ANIMALS)
+        const animals = [];
+        // Fluffy body using Dodecahedron
+        const sheepBodyGeo = new THREE.DodecahedronGeometry(0.9, 1);
+        sheepBodyGeo.translate(0, 1.2, 0); 
+        const sheepBodyMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1.0, flatShading: true });
+        
+        // Cute dark head
+        const sheepHeadGeo = new THREE.BoxGeometry(0.7, 0.6, 0.8);
+        sheepHeadGeo.translate(0, 1.5, 0.8);
+        const sheepHeadMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+
+        // Little legs
+        const legGeo = new THREE.CylinderGeometry(0.12, 0.1, 0.8, 5);
+        legGeo.translate(0, 0.4, 0);
+
+        for(let i=0; i<ANIMAL_COUNT; i++) {
+            let animal = new THREE.Group();
+            
+            let body = new THREE.Mesh(sheepBodyGeo, sheepBodyMat);
+            body.castShadow = true;
+            let head = new THREE.Mesh(sheepHeadGeo, sheepHeadMat);
+            head.castShadow = true;
+            
+            let legFL = new THREE.Mesh(legGeo, sheepHeadMat); legFL.position.set(0.4, 0, 0.5); legFL.castShadow = true;
+            let legFR = new THREE.Mesh(legGeo, sheepHeadMat); legFR.position.set(-0.4, 0, 0.5); legFR.castShadow = true;
+            let legBL = new THREE.Mesh(legGeo, sheepHeadMat); legBL.position.set(0.4, 0, -0.5); legBL.castShadow = true;
+            let legBR = new THREE.Mesh(legGeo, sheepHeadMat); legBR.position.set(-0.4, 0, -0.5); legBR.castShadow = true;
+
+            animal.add(body, head, legFL, legFR, legBL, legBR);
+            
+            let dir = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize();
+            let surf = getSurfaceData(dir);
+            if (!surf.isWater) {
+                animal.position.copy(surf.position);
+                animal.quaternion.setFromUnitVectors(upVec, dir);
+                animal.rotateY(Math.random() * Math.PI * 2);
+                
+                // Randomly scale sheep sizes slightly
+                let scale = 0.7 + Math.random() * 0.6;
+                animal.scale.set(scale, scale, scale);
+                
+                scene.add(animal);
+                
+                animals.push({
+                    mesh: animal,
+                    speed: 1.0 + Math.random() * 1.5,
+                    turnTimer: 0,
+                    targetYaw: 0,
+                    currentYaw: 0,
+                    legs: [legFL, legFR, legBL, legBR],
+                    walkCycle: Math.random() * 10
+                });
+            }
+        }
+
+        // H. Detailed Flying Bugs (IMPROVED ENEMIES)
+        const enemies = [];
+        
+        // Bulbous Abdomen
+        const bugAbdomenGeo = new THREE.SphereGeometry(1.4, 12, 12);
+        bugAbdomenGeo.scale(1.0, 0.8, 1.4);
+        bugAbdomenGeo.translate(0, 0, -0.8);
+        const bugBodyMat = new THREE.MeshStandardMaterial({ color: 0x1a7a3b, roughness: 0.5, flatShading: true });
+        
+        // Thorax / Head
+        const bugHeadGeo = new THREE.SphereGeometry(0.8, 10, 10);
+        bugHeadGeo.scale(1, 0.9, 1);
+        bugHeadGeo.translate(0, -0.2, 1.0);
+        const bugHeadMat = new THREE.MeshStandardMaterial({ color: 0x0f4a21, flatShading: true });
+        
+        // Glowing Eyes
+        const eyeGeo = new THREE.SphereGeometry(0.25, 8, 8);
+        const eyeMat = new THREE.MeshStandardMaterial({ color: 0xff3333, emissive: 0xcc1111, emissiveIntensity: 0.8 });
+        
+        // Antennae
+        const antGeo = new THREE.CylinderGeometry(0.05, 0.05, 1.2, 5);
+        antGeo.translate(0, 0.6, 0);
+        antGeo.rotateX(Math.PI / 4);
+        const antMat = new THREE.MeshStandardMaterial({ color: 0xddcc33 });
+
+        // Wings (More organic elliptical shape)
+        const wingGeo = new THREE.CylinderGeometry(1.5, 1.5, 0.05, 12);
+        wingGeo.scale(0.8, 1, 1.8);
+        wingGeo.translate(1.2, 0, -0.5); // Pivot point inside body
+        const wingMat = new THREE.MeshStandardMaterial({ color: 0xaaddff, transparent: true, opacity: 0.6, side: THREE.DoubleSide });
+
+        // Dangling Legs
+        const bugLegGeo = new THREE.CylinderGeometry(0.08, 0.02, 1.5, 4);
+        bugLegGeo.translate(0, -0.75, 0);
+        const bugLegMat = new THREE.MeshStandardMaterial({ color: 0x0a2a12 });
+
+        for(let i=0; i<ENEMY_COUNT; i++) {
+            let bug = new THREE.Group();
+            
+            let abdomen = new THREE.Mesh(bugAbdomenGeo, bugBodyMat); abdomen.castShadow = true;
+            let head = new THREE.Mesh(bugHeadGeo, bugHeadMat); head.castShadow = true;
+            
+            let eyeL = new THREE.Mesh(eyeGeo, eyeMat); eyeL.position.set(0.4, 0.1, 1.6);
+            let eyeR = new THREE.Mesh(eyeGeo, eyeMat); eyeR.position.set(-0.4, 0.1, 1.6);
+            
+            let antL = new THREE.Mesh(antGeo, antMat); antL.position.set(0.3, 0.4, 1.4); antL.rotateZ(-0.3);
+            let antR = new THREE.Mesh(antGeo, antMat); antR.position.set(-0.3, 0.4, 1.4); antR.rotateZ(0.3);
+            
+            let wingL = new THREE.Mesh(wingGeo, wingMat); wingL.position.set(0.4, 0.8, 0);
+            let wingR = new THREE.Mesh(wingGeo, wingMat); wingR.position.set(-0.4, 0.8, 0); wingR.scale.x = -1;
+
+            // Add 6 legs
+            let legs = [];
+            for(let j=0; j<6; j++) {
+                let l = new THREE.Mesh(bugLegGeo, bugLegMat);
+                let side = (j%2 === 0) ? 1 : -1;
+                let zPos = 0.5 - Math.floor(j/2) * 0.8;
+                l.position.set(side * 0.8, -0.4, zPos);
+                // Splay outwards
+                l.rotation.z = side * 0.4;
+                l.rotation.x = (Math.random() - 0.5) * 0.5;
+                legs.push(l);
+                bug.add(l);
+            }
+
+            bug.add(abdomen, head, eyeL, eyeR, antL, antR, wingL, wingR);
+            
+            let dir = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize();
+            let surf = getSurfaceData(dir);
+            
+            let hoverHeight = surf.position.length() + 10 + Math.random() * 8;
+            bug.position.copy(dir.multiplyScalar(hoverHeight));
+            bug.quaternion.setFromUnitVectors(upVec, dir);
+            bug.rotateY(Math.random() * Math.PI * 2);
+            
+            // Random scaling for bug variety
+            let scale = 1.0 + Math.random() * 0.8;
+            bug.scale.set(scale, scale, scale);
+
+            scene.add(bug);
+            
+            enemies.push({
+                mesh: bug,
+                wingL: wingL,
+                wingR: wingR,
+                legs: legs,
+                speed: 6 + Math.random() * 4,
+                targetYaw: Math.random() * Math.PI * 2,
+                currentYaw: 0,
+                baseHeightOffset: hoverHeight - PLANET_RADIUS,
+                bobTimer: Math.random() * 100
+            });
+        }
+
+        // I. Magical Fireflies / Environmental Particles
+        const firefliesGeo = new THREE.BufferGeometry();
+        const firefliesArr = [];
+        const fireflyData = [];
+        for(let i=0; i<1000; i++) {
+            let dir = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).normalize();
+            let surf = getSurfaceData(dir);
+            let height = surf.position.length() + 0.5 + Math.random() * 4;
+            let pos = dir.multiplyScalar(height);
+            
+            firefliesArr.push(pos.x, pos.y, pos.z);
+            fireflyData.push({
+                basePos: pos.clone(),
+                speedX: (Math.random() - 0.5) * 2,
+                speedY: (Math.random() - 0.5) * 2,
+                speedZ: (Math.random() - 0.5) * 2,
+                phase: Math.random() * Math.PI * 2
+            });
+        }
+        firefliesGeo.setAttribute('position', new THREE.Float32BufferAttribute(firefliesArr, 3));
+        const firefliesMat = new THREE.PointsMaterial({ 
+            color: 0xaaffaa, 
+            size: 1.5, 
+            transparent: true, 
+            opacity: 0.8, 
+            blending: THREE.AdditiveBlending,
+            depthWrite: false
+        });
+        const fireflies = new THREE.Points(firefliesGeo, firefliesMat);
+        scene.add(fireflies);
+
+        // --- 6. PLAYER CONTROLLER ---
+        const playerRig = new THREE.Object3D();
+        scene.add(playerRig);
+        playerRig.add(camera);
+
+        const toolGroup = new THREE.Group();
+        const stickGeo = new THREE.CylinderGeometry(0.04, 0.04, 1.2);
+        stickGeo.translate(0, 0.6, 0);
+        const stickMat = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
+        const stick = new THREE.Mesh(stickGeo, stickMat);
+        
+        const crystalGeo = new THREE.OctahedronGeometry(0.15);
+        crystalGeo.translate(0, 1.3, 0);
+        const crystalMat = new THREE.MeshStandardMaterial({ color: 0x4ade80, emissive: 0x22c55e, emissiveIntensity: 0.5, flatShading: true });
+        const crystal = new THREE.Mesh(crystalGeo, crystalMat);
+        
+        toolGroup.add(stick);
+        toolGroup.add(crystal);
+        toolGroup.position.set(0.4, -0.5, -0.6);
+        toolGroup.rotation.x = 1.2;
+        toolGroup.rotation.z = -0.2;
+        camera.add(toolGroup);
+
+        let startDir = new THREE.Vector3(0, 1, 0).normalize();
+        let startSurf = getSurfaceData(startDir);
+        playerRig.position.copy(startDir.multiplyScalar(startSurf.position.length() + PLAYER_HEIGHT));
+        playerRig.quaternion.setFromUnitVectors(upVec, startDir);
+
+        const blocker = document.getElementById('blocker');
+        const startButton = document.getElementById('startButton');
+        const crosshair = document.getElementById('crosshair');
+
+        startButton.addEventListener('click', () => {
+            document.body.requestPointerLock();
+        });
+
+        document.addEventListener('pointerlockchange', () => {
+            if (document.pointerLockElement === document.body) {
+                isLocked = true;
+                blocker.style.display = 'none';
+                crosshair.style.display = 'block';
+                prevTime = performance.now(); 
+            } else {
+                isLocked = false;
+                blocker.style.display = 'flex';
+                crosshair.style.display = 'none';
+            }
+        });
+
+        document.addEventListener('mousemove', (event) => {
+            if (!isLocked) return;
+            const movementX = event.movementX || 0;
+            const movementY = event.movementY || 0;
+            playerRig.rotateY(-movementX * 0.002);
+            pitch -= movementY * 0.002;
+            pitch = Math.max(-pitchLimit, Math.min(pitchLimit, pitch));
+            camera.rotation.x = pitch;
+        });
+
+        document.addEventListener('keydown', (e) => {
+            switch(e.code) {
+                case 'KeyW': moveForward = true; break;
+                case 'KeyS': moveBackward = true; break;
+                case 'KeyA': moveLeft = true; break;
+                case 'KeyD': moveRight = true; break;
+            }
+        });
+
+        document.addEventListener('keyup', (e) => {
+            switch(e.code) {
+                case 'KeyW': moveForward = false; break;
+                case 'KeyS': moveBackward = false; break;
+                case 'KeyA': moveLeft = false; break;
+                case 'KeyD': moveRight = false; break;
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- 7. MAIN UPDATE LOOP & EFFECTS ---
+        const velocity = new THREE.Vector3();
+        let toolBobTimer = 0;
+        let dayTime = 0; 
+        const daySpeed = 0.05;
+
+        const skyColorDay = new THREE.Color(0x4ca1af);
+        const skyColorNight = new THREE.Color(0x0f172a);
+        const fogColorDay = new THREE.Color(0x87CEEB);
+        const fogColorNight = new THREE.Color(0x0f172a);
+        const ambientDay = new THREE.Color(0xffffff);
+        const ambientNight = new THREE.Color(0x222244);
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const time = performance.now();
+            let delta = (time - prevTime) / 1000;
+            if(delta > 0.1) delta = 0.1; 
+            prevTime = time;
+
+            dayTime += delta * daySpeed;
+            sunLight.position.set(Math.cos(dayTime) * 400, Math.sin(dayTime) * 400, 150);
+            
+            let sunHeight = Math.sin(dayTime);
+            let dayRatio = Math.max(0, Math.min(1, (sunHeight + 0.2) / 0.4)); 
+
+            spaceMat.color.lerpColors(skyColorNight, skyColorDay, dayRatio);
+            scene.fog.color.lerpColors(fogColorNight, fogColorDay, dayRatio);
+            ambientLight.color.lerpColors(ambientNight, ambientDay, dayRatio);
+            
+            sunLight.intensity = Math.max(0, sunHeight * 1.5); 
+            ambientLight.intensity = 0.3 + (dayRatio * 0.4);
+
+            starsMat.opacity = 1.0 - dayRatio;
+
+            cloudsRig.rotation.y -= delta * 0.02;
+            cloudsRig.rotation.z += delta * 0.01;
+            cloudsRig.position.y = Math.sin(time * 0.001) * 2;
+            waterMesh.rotation.y += delta * 0.05;
+
+            const flyPositions = fireflies.geometry.attributes.position.array;
+            let nightBoost = 1.0 - dayRatio; 
+            firefliesMat.opacity = 0.2 + (nightBoost * 0.8);
+            
+            for(let i=0; i<1000; i++) {
+                let data = fireflyData[i];
+                let offsetX = Math.sin(time * 0.001 + data.phase) * data.speedX;
+                let offsetY = Math.cos(time * 0.0013 + data.phase) * data.speedY;
+                let offsetZ = Math.sin(time * 0.0009 + data.phase) * data.speedZ;
+                
+                flyPositions[i*3] = data.basePos.x + offsetX;
+                flyPositions[i*3+1] = data.basePos.y + offsetY;
+                flyPositions[i*3+2] = data.basePos.z + offsetZ;
+            }
+            fireflies.geometry.attributes.position.needsUpdate = true;
+
+            // Animate Sheep
+            animals.forEach(animal => {
+                animal.turnTimer -= delta;
+                if (animal.turnTimer <= 0) {
+                    animal.targetYaw = (Math.random() - 0.5) * Math.PI * 2;
+                    animal.turnTimer = 2 + Math.random() * 4;
+                    if (Math.random() > 0.6) animal.speed = 0;
+                    else animal.speed = 1.0 + Math.random() * 2.0;
+                }
+
+                if (animal.speed > 0) {
+                    animal.currentYaw = THREE.MathUtils.lerp(animal.currentYaw, animal.targetYaw, delta * 3);
+                    let localForward = new THREE.Vector3(0, 0, 1).applyAxisAngle(new THREE.Vector3(0,1,0), animal.currentYaw);
+                    let worldMove = localForward.multiplyScalar(animal.speed * delta).applyQuaternion(animal.mesh.quaternion);
+                    
+                    let nextPos = animal.mesh.position.clone().add(worldMove);
+                    let nextDir = nextPos.normalize();
+                    let surf = getSurfaceData(nextDir);
+                    
+                    if (!surf.isWater) {
+                        const currentUp = new THREE.Vector3(0, 1, 0).applyQuaternion(animal.mesh.quaternion);
+                        const alignQuat = new THREE.Quaternion().setFromUnitVectors(currentUp, nextDir);
+                        animal.mesh.quaternion.premultiply(alignQuat);
+                        animal.mesh.position.copy(nextDir.multiplyScalar(surf.position.length()));
+                        
+                        // Leg walking animation
+                        animal.walkCycle += delta * animal.speed * 8;
+                        animal.legs[0].position.y = Math.max(0, Math.sin(animal.walkCycle) * 0.2); // FL
+                        animal.legs[1].position.y = Math.max(0, Math.sin(animal.walkCycle + Math.PI) * 0.2); // FR
+                        animal.legs[2].position.y = Math.max(0, Math.sin(animal.walkCycle + Math.PI) * 0.2); // BL
+                        animal.legs[3].position.y = Math.max(0, Math.sin(animal.walkCycle) * 0.2); // BR
+                        
+                        // Body bob
+                        animal.mesh.children[0].position.y = 1.2 + Math.sin(animal.walkCycle*2) * 0.05;
+                    } else {
+                        animal.targetYaw += Math.PI;
+                    }
+                }
+            });
+
+            // Animate Giant Bugs
+            enemies.forEach(bug => {
+                // Flap wings rapidly
+                bug.wingL.rotation.z = Math.sin(time * 0.05) * 1.2;
+                bug.wingR.rotation.z = -Math.sin(time * 0.05) * 1.2;
+
+                // Wiggle legs slightly
+                bug.legs.forEach((leg, idx) => {
+                    leg.rotation.x = Math.sin(time * 0.01 + idx) * 0.2;
+                });
+
+                bug.bobTimer += delta;
+                if (Math.random() < 0.01) {
+                    bug.targetYaw += (Math.random() - 0.5) * Math.PI;
+                }
+                bug.currentYaw = THREE.MathUtils.lerp(bug.currentYaw, bug.targetYaw, delta);
+
+                let localForward = new THREE.Vector3(0, 0, 1).applyAxisAngle(new THREE.Vector3(0,1,0), bug.currentYaw);
+                let worldMove = localForward.multiplyScalar(bug.speed * delta).applyQuaternion(bug.mesh.quaternion);
+                
+                let nextPos = bug.mesh.position.clone().add(worldMove);
+                let nextDir = nextPos.normalize();
+                
+                const currentUp = new THREE.Vector3(0, 1, 0).applyQuaternion(bug.mesh.quaternion);
+                const alignQuat = new THREE.Quaternion().setFromUnitVectors(currentUp, nextDir);
+                bug.mesh.quaternion.premultiply(alignQuat);
+                
+                let bobbing = Math.sin(bug.bobTimer * 3) * 1.5;
+                bug.mesh.position.copy(nextDir.multiplyScalar(PLANET_RADIUS + bug.baseHeightOffset + bobbing));
+            });
+
+            if (isLocked) {
+                velocity.set(0, 0, 0);
+                if (moveForward) velocity.z -= 1;
+                if (moveBackward) velocity.z += 1;
+                if (moveLeft) velocity.x -= 1;
+                if (moveRight) velocity.x += 1;
+
+                let isMoving = velocity.lengthSq() > 0;
+
+                if (isMoving) {
+                    velocity.normalize().multiplyScalar(PLAYER_SPEED * delta);
+                    const localMove = velocity.clone().applyQuaternion(playerRig.quaternion);
+                    let nextPos = playerRig.position.clone().add(localMove);
+                    let nextDir = nextPos.clone().normalize();
+                    let surf = getSurfaceData(nextDir);
+
+                    const currentUp = new THREE.Vector3(0, 1, 0).applyQuaternion(playerRig.quaternion);
+                    const alignQuat = new THREE.Quaternion().setFromUnitVectors(currentUp, nextDir);
+                    playerRig.quaternion.premultiply(alignQuat);
+
+                    let finalHeight = surf.position.length() + PLAYER_HEIGHT;
+                    if(surf.isWater) {
+                         finalHeight = surf.waterLevel.length() + PLAYER_HEIGHT - 0.5;
+                    }
+                    
+                    playerRig.position.copy(nextDir.multiplyScalar(finalHeight));
+
+                    toolBobTimer += delta * 12;
+                    toolGroup.position.y = -0.5 + Math.sin(toolBobTimer) * 0.03;
+                    toolGroup.position.x = 0.4 + Math.cos(toolBobTimer * 0.5) * 0.03;
+                } else {
+                    toolGroup.position.y = THREE.MathUtils.lerp(toolGroup.position.y, -0.5, delta * 5);
+                    toolGroup.position.x = THREE.MathUtils.lerp(toolGroup.position.x, 0.4, delta * 5);
+                }
+            }
+
+            crystalMat.emissiveIntensity = 0.5 + Math.sin(time * 0.003) * 0.3;
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>
